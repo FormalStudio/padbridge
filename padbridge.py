@@ -104,6 +104,9 @@ DEFAULTS = {
     "ipad_width": 1800,  # mouse counts to cross the iPad, used to detect the return edge
     "sensitivity": 1.0,
     "edge_push": 40,  # counts past the edge before switching, stops accidental crossings
+    # The iPad's pointer acceleration lets the counted position reach its edge early, so going
+    # back takes one unbroken shove past it.
+    "return_push": 300,
     "toggle": ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_I"],
     "name": "g815",
 }
@@ -366,6 +369,7 @@ class Bridge:
         self.vx = 0.0
         self.edge_push = 0
         self.last_query = 0.0
+        self.push_at = 0.0
         self.monitors = []
         self.toggle = {e.ecodes[k] for k in cfg["toggle"]}
         self.pairing = pair_seconds > 0
@@ -597,8 +601,12 @@ class Bridge:
     def track_return(self, dx):
         inward = dx if self.cfg["edge"] == "right" else -dx
         if inward < 0 and self.vx <= 0:
+            now = time.monotonic()
+            if now - self.push_at > 0.1:
+                self.edge_push = 0
+            self.push_at = now
             self.edge_push -= inward
-            if self.edge_push >= self.cfg["edge_push"] and not self.keys and not self.buttons:
+            if self.edge_push >= self.cfg["return_push"] and not self.keys and not self.buttons:
                 GLib.idle_add(self.leave_ipad)
             return
         self.edge_push = 0
