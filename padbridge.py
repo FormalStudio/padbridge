@@ -204,6 +204,7 @@ class Characteristic(dbus.service.Object):
         self.value = bytes(value)
         self.descriptors = []
         self.notifying = False
+        self.on_subscribe = None
         self.bus = bus
         super().__init__(bus, self.path)
 
@@ -238,10 +239,14 @@ class Characteristic(dbus.service.Object):
     def StartNotify(self):
         self.notifying = True
         log(f"notify on {self.uuid} {self.path}")
+        if self.on_subscribe:
+            self.on_subscribe()
 
     @dbus.service.method(GATT_CHRC)
     def StopNotify(self):
         self.notifying = False
+        if self.on_subscribe:
+            self.on_subscribe()
 
     @dbus.service.signal(PROPS, signature="sa{sv}as")
     def PropertiesChanged(self, interface, changed, invalidated):
@@ -377,6 +382,9 @@ class Bridge:
         self.monitors = []
         self.toggle = {e.ecodes[k] for k in cfg["toggle"]}
         self.pairing = pair_seconds > 0
+        self.reports[MOUSE_ID].on_subscribe = self.on_hid_change
+        self.connecting = False
+        self.warned_down = False
         self.pair_seconds = pair_seconds
 
     # bluetooth
@@ -415,6 +423,45 @@ class Bridge:
             if ifaces.get("org.bluez.Device1", {}).get("Connected"):
                 self.connect_audio(path)
 
+    def hid_ready(self):
+        return self.reports[MOUSE_ID].notifying
+
+    def on_hid_change(self):
+        if self.hid_ready():
+            path = self.ipad_path()
+            if path:
+                GLib.timeout_add_seconds(1, self.connect_audio, path)
+        elif self.on_ipad:
+            self.leave_ipad()
+
+    def ipad_path(self):
+        try:
+            ipad = IPAD_FILE.read_text().strip()
+        except FileNotFoundError:
+            return None
+        objs = dbus.Interface(self.bus.get_object(BLUEZ, "/"), OM).GetManagedObjects()
+        for path, ifaces in objs.items():
+            if ifaces.get("org.bluez.Device1", {}).get("Address") == ipad:
+                return path
+        return None
+
+    def check_links(self):
+        """iPadOS does not come back over BLE on its own while its audio link is up, so call it."""
+        path = self.ipad_path()
+        if not path or self.hid_ready() or self.connecting:
+            return True
+        self.connecting = True
+
+        def done(err=None):
+            self.connecting = False
+            if err:
+                log(f"input link: {err}")
+
+        log("input link down, connecting to the iPad")
+        dbus.Interface(self.bus.get_object(BLUEZ, path), "org.bluez.Bearer.LE1").Connect(
+            reply_handler=done, error_handler=done, timeout=30)
+        return True
+
     def on_device_changed(self, interface, changed, invalidated, path):
         if changed.get("Connected"):
             GLib.timeout_add_seconds(2, self.connect_audio, path)
@@ -429,7 +476,7 @@ class Bridge:
         try:
             if props.Get("org.bluez.Device1", "Address") != ipad:
                 return False
-            if props.Get("org.bluez.Bearer.BREDR1", "Connected"):
+            if props.Get("org.bluez.Bearer.BREDR1", "Connected") or not self.hid_ready():
                 return False
         except dbus.DBusException:
             return False
@@ -521,6 +568,13 @@ class Bridge:
     def enter_ipad(self):
         if self.on_ipad:
             return
+        if not self.hid_ready():
+            if not self.warned_down:
+                log("ipad input link is down, staying here")
+            self.warned_down = True
+            self.edge_push = 0
+            return
+        self.warned_down = False
         self.on_ipad = True
         self.return_y = self.hypr.cursor()[1]
         for d, _ in self.devices.values():
@@ -719,6 +773,7 @@ def main():
     bridge = Bridge(cfg, bus, find_adapter(bus), args.pair)
     bridge.start_bluetooth()
     bridge.watch_audio()
+    GLib.timeout_add_seconds(5, bridge.check_links)
     bridge.refresh_monitors()
     bridge.scan()
     GLib.timeout_add_seconds(2, bridge.scan)
