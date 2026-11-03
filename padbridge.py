@@ -34,6 +34,9 @@ GATT_CHRC = "org.bluez.GattCharacteristic1"
 GATT_DESC = "org.bluez.GattDescriptor1"
 
 APP_PATH = "/es/canarycoders/padbridge"
+A2DP_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"
+# Address of the paired iPad, written at pairing. Its audio link is brought up whenever it connects.
+IPAD_FILE = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "padbridge" / "ipad"
 
 KBD_ID, MOUSE_ID, CONSUMER_ID = 1, 2, 3
 
@@ -303,6 +306,7 @@ class Agent(dbus.service.Object):
         if not self.bridge.pairing:
             raise dbus.DBusException("pairing window closed", name="org.bluez.Error.Rejected")
         log(f"accepting pairing from {device}")
+        self.bridge.remember(device)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ou")
     def RequestConfirmation(self, device, passkey):
@@ -394,6 +398,50 @@ class Bridge:
             props.Set("org.bluez.Adapter1", "Pairable", True)
             log(f"pairing open for {self.pair_seconds}s: on the iPad, Settings > Bluetooth > {self.cfg['name']}")
             GLib.timeout_add_seconds(self.pair_seconds, self.close_pairing)
+
+    def remember(self, path):
+        dev = self.bus.get_object(BLUEZ, path)
+        props = dbus.Interface(dev, PROPS)
+        props.Set("org.bluez.Device1", "Trusted", True)
+        IPAD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        IPAD_FILE.write_text(str(props.Get("org.bluez.Device1", "Address")) + "\n")
+
+    def watch_audio(self):
+        """iPadOS only sends audio over a classic link the other side opens, as headphones do."""
+        self.bus.add_signal_receiver(self.on_device_changed, "PropertiesChanged", PROPS, BLUEZ,
+                                     arg0="org.bluez.Device1", path_keyword="path")
+        objs = dbus.Interface(self.bus.get_object(BLUEZ, "/"), OM).GetManagedObjects()
+        for path, ifaces in objs.items():
+            if ifaces.get("org.bluez.Device1", {}).get("Connected"):
+                self.connect_audio(path)
+
+    def on_device_changed(self, interface, changed, invalidated, path):
+        if changed.get("Connected"):
+            GLib.timeout_add_seconds(2, self.connect_audio, path)
+
+    def connect_audio(self, path, attempt=0):
+        try:
+            ipad = IPAD_FILE.read_text().strip()
+        except FileNotFoundError:
+            return False
+        dev = self.bus.get_object(BLUEZ, path)
+        props = dbus.Interface(dev, PROPS)
+        try:
+            if props.Get("org.bluez.Device1", "Address") != ipad:
+                return False
+            if props.Get("org.bluez.Bearer.BREDR1", "Connected"):
+                return False
+        except dbus.DBusException:
+            return False
+
+        def retry(err):
+            log(f"audio link: {err}")
+            if attempt < 3:
+                GLib.timeout_add_seconds(5, self.connect_audio, path, attempt + 1)
+
+        dbus.Interface(dev, "org.bluez.Device1").ConnectProfile(
+            A2DP_SOURCE, reply_handler=lambda: log("audio link up"), error_handler=retry)
+        return False
 
     def close_pairing(self):
         self.pairing = False
@@ -670,6 +718,7 @@ def main():
     bus = dbus.SystemBus()
     bridge = Bridge(cfg, bus, find_adapter(bus), args.pair)
     bridge.start_bluetooth()
+    bridge.watch_audio()
     bridge.refresh_monitors()
     bridge.scan()
     GLib.timeout_add_seconds(2, bridge.scan)
