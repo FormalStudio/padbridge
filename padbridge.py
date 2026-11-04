@@ -32,6 +32,7 @@ PROPS = "org.freedesktop.DBus.Properties"
 GATT_SERVICE = "org.bluez.GattService1"
 GATT_CHRC = "org.bluez.GattCharacteristic1"
 GATT_DESC = "org.bluez.GattDescriptor1"
+LE_BEARER = "org.bluez.Bearer.LE1"
 
 APP_PATH = "/es/canarycoders/padbridge"
 A2DP_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"
@@ -108,15 +109,22 @@ DEFAULTS = {
     "sensitivity": 1.0,
     "edge_push": 40,  # counts past the edge before switching, stops accidental crossings
     # The iPad's pointer acceleration lets the counted position reach its edge early, so going
-    # back takes one unbroken shove past it.
+    # back takes a fast shove past it: this many counts within RETURN_WINDOW.
     "return_push": 300,
     "toggle": ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_I"],
     "name": "g815",
 }
 
+# A slow drift past the counted edge never adds up to return_push within this many seconds.
+RETURN_WINDOW = 0.1
+
 
 def log(*a):
     print(*a, flush=True)
+
+
+def debug(*a):
+    print("<7>" + " ".join(map(str, a)), flush=True)
 
 
 class Hyprland:
@@ -203,8 +211,6 @@ class Characteristic(dbus.service.Object):
         self.flags = flags
         self.value = bytes(value)
         self.descriptors = []
-        self.notifying = False
-        self.on_subscribe = None
         self.bus = bus
         super().__init__(bus, self.path)
 
@@ -237,25 +243,21 @@ class Characteristic(dbus.service.Object):
 
     @dbus.service.method(GATT_CHRC)
     def StartNotify(self):
-        self.notifying = True
         log(f"notify on {self.uuid} {self.path}")
-        if self.on_subscribe:
-            self.on_subscribe()
 
     @dbus.service.method(GATT_CHRC)
     def StopNotify(self):
-        self.notifying = False
-        if self.on_subscribe:
-            self.on_subscribe()
+        debug(f"notify off {self.uuid} {self.path}")
 
     @dbus.service.signal(PROPS, signature="sa{sv}as")
     def PropertiesChanged(self, interface, changed, invalidated):
         pass
 
+    # BlueZ only calls StartNotify for the first subscriber and keeps a bonded device's
+    # subscription across disconnects without calling StopNotify, so it decides who gets this.
     def notify(self, value):
         self.value = bytes(value)
-        if self.notifying:
-            self.PropertiesChanged(GATT_CHRC, {"Value": dbus.Array(self.value, signature="y")}, [])
+        self.PropertiesChanged(GATT_CHRC, {"Value": dbus.Array(self.value, signature="y")}, [])
 
 
 class Descriptor(dbus.service.Object):
@@ -382,7 +384,8 @@ class Bridge:
         self.monitors = []
         self.toggle = {e.ecodes[k] for k in cfg["toggle"]}
         self.pairing = pair_seconds > 0
-        self.reports[MOUSE_ID].on_subscribe = self.on_hid_change
+        self.le_up = False
+        self.sent = 0
         self.connecting = False
         self.warned_down = False
         self.pair_seconds = pair_seconds
@@ -414,25 +417,43 @@ class Bridge:
         IPAD_FILE.parent.mkdir(parents=True, exist_ok=True)
         IPAD_FILE.write_text(str(props.Get("org.bluez.Device1", "Address")) + "\n")
 
-    def watch_audio(self):
-        """iPadOS only sends audio over a classic link the other side opens, as headphones do."""
+    def watch_links(self):
+        """iPadOS only sends audio over a classic link the other side opens, as headphones do.
+
+        Input goes over the LE link alone, which can drop while the classic one stays up.
+        """
         self.bus.add_signal_receiver(self.on_device_changed, "PropertiesChanged", PROPS, BLUEZ,
                                      arg0="org.bluez.Device1", path_keyword="path")
+        self.bus.add_signal_receiver(self.on_le_changed, "PropertiesChanged", PROPS, BLUEZ,
+                                     arg0=LE_BEARER, path_keyword="path")
+        self.bus.add_signal_receiver(self.on_le_disconnected, "Disconnected", LE_BEARER, BLUEZ,
+                                     path_keyword="path")
         objs = dbus.Interface(self.bus.get_object(BLUEZ, "/"), OM).GetManagedObjects()
         for path, ifaces in objs.items():
             if ifaces.get("org.bluez.Device1", {}).get("Connected"):
                 self.connect_audio(path)
+        self.check_links()
 
     def hid_ready(self):
-        return self.reports[MOUSE_ID].notifying
+        return self.le_up
 
-    def on_hid_change(self):
-        if self.hid_ready():
-            path = self.ipad_path()
-            if path:
-                GLib.timeout_add_seconds(1, self.connect_audio, path)
+    def set_input_link(self, up, path):
+        if up == self.le_up:
+            return
+        self.le_up = up
+        log(f"input link {'up' if up else 'down'}")
+        if up:
+            GLib.timeout_add_seconds(1, self.connect_audio, path)
         elif self.on_ipad:
-            self.leave_ipad()
+            self.leave_ipad("input link down")
+
+    def on_le_changed(self, interface, changed, invalidated, path):
+        if "Connected" in changed and path == self.ipad_path():
+            self.set_input_link(bool(changed["Connected"]), path)
+
+    def on_le_disconnected(self, name, message, path):
+        if path == self.ipad_path():
+            debug(f"input link dropped: {name} ({message})")
 
     def ipad_path(self):
         try:
@@ -446,19 +467,26 @@ class Bridge:
         return None
 
     def check_links(self):
-        """iPadOS does not come back over BLE on its own while its audio link is up, so call it."""
+        """iPadOS does not come back over BLE on its own while its audio link is up, so call it.
+
+        Also picks up an LE link that came up before the iPad's address was known, at pairing.
+        """
         path = self.ipad_path()
-        if not path or self.hid_ready() or self.connecting:
+        if not path:
+            return True
+        props = dbus.Interface(self.bus.get_object(BLUEZ, path), PROPS)
+        self.set_input_link(bool(props.Get(LE_BEARER, "Connected")), path)
+        if self.le_up or self.connecting:
             return True
         self.connecting = True
 
         def done(err=None):
             self.connecting = False
             if err:
-                log(f"input link: {err}")
+                debug(f"input link: {err}")
 
-        log("input link down, connecting to the iPad")
-        dbus.Interface(self.bus.get_object(BLUEZ, path), "org.bluez.Bearer.LE1").Connect(
+        debug("input link down, connecting to the iPad")
+        dbus.Interface(self.bus.get_object(BLUEZ, path), LE_BEARER).Connect(
             reply_handler=done, error_handler=done, timeout=30)
         return True
 
@@ -576,6 +604,7 @@ class Bridge:
             return
         self.warned_down = False
         self.on_ipad = True
+        self.sent = 0
         self.return_y = self.hypr.cursor()[1]
         for d, _ in self.devices.values():
             self.grab(d)
@@ -586,7 +615,7 @@ class Bridge:
         self.edge_push = 0
         log("-> ipad")
 
-    def leave_ipad(self):
+    def leave_ipad(self, reason):
         if not self.on_ipad:
             return
         self.on_ipad = False
@@ -599,7 +628,8 @@ class Bridge:
         except OSError:
             pass
         self.edge_push = 0
-        log("<- linux")
+        log(f"<- linux ({reason})")
+        debug(f"sent {self.sent} mouse reports while on the iPad")
 
     def release_all(self):
         self.keys.clear()
@@ -698,20 +728,23 @@ class Bridge:
             self.send_keys()
             if self.pending_toggle and not self.keys:
                 self.pending_toggle = False
-                self.leave_ipad()
+                self.leave_ipad("chord")
 
     def track_return(self, dx):
         inward = dx if self.cfg["edge"] == "right" else -dx
         if inward < 0 and self.vx <= 0:
             now = time.monotonic()
-            if now - self.push_at > 0.1:
+            if now - self.push_at > RETURN_WINDOW:
                 self.edge_push = 0
-            self.push_at = now
+                self.push_at = now
             self.edge_push -= inward
             if self.edge_push >= self.cfg["return_push"] and not self.keys and not self.buttons:
-                GLib.idle_add(self.leave_ipad)
+                debug(f"shove of {self.edge_push:.0f} counts in {now - self.push_at:.3f}s")
+                GLib.idle_add(self.leave_ipad, "shove")
+                self.edge_push = 0
             return
         self.edge_push = 0
+        self.push_at = 0.0
         self.vx = min(self.cfg["ipad_width"], max(0.0, self.vx + inward))
 
     def send_keys(self):
@@ -733,6 +766,9 @@ class Bridge:
         return False
 
     def send_mouse(self, dx, dy, wheel=0, pan=0):
+        if self.sent == 0:
+            debug(f"first mouse report to the iPad, input link {'up' if self.le_up else 'down'}")
+        self.sent += 1
         clamp = lambda v, lo, hi: max(lo, min(hi, v))
         dx, dy = clamp(dx, -32767, 32767), clamp(dy, -32767, 32767)
         self.reports[MOUSE_ID].notify(
@@ -772,7 +808,7 @@ def main():
     bus = dbus.SystemBus()
     bridge = Bridge(cfg, bus, find_adapter(bus), args.pair)
     bridge.start_bluetooth()
-    bridge.watch_audio()
+    bridge.watch_links()
     GLib.timeout_add_seconds(5, bridge.check_links)
     bridge.refresh_monitors()
     bridge.scan()
