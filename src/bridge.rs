@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::bluez::Cmd;
-use crate::gatt::Reports;
+use crate::link::Hid;
 use crate::hid;
 use crate::hypr::{Hypr, Monitor};
 use crate::{debug, log};
@@ -61,7 +61,7 @@ pub struct Bridge {
     cfg: Config,
     toggle: Vec<KeyCode>,
     hypr: Hypr,
-    reports: Reports,
+    hid: Hid,
     grab: watch::Sender<bool>,
     wake: mpsc::UnboundedSender<Cmd>,
     le_up: bool,
@@ -88,7 +88,7 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(cfg: Config, reports: Reports, grab: watch::Sender<bool>, wake: mpsc::UnboundedSender<Cmd>) -> Self {
+    pub fn new(cfg: Config, hid: Hid, grab: watch::Sender<bool>, wake: mpsc::UnboundedSender<Cmd>) -> Self {
         let toggle = cfg
             .toggle
             .iter()
@@ -104,7 +104,7 @@ impl Bridge {
             cfg,
             toggle,
             hypr: Hypr::default(),
-            reports,
+            hid,
             grab,
             wake,
             le_up: false,
@@ -229,10 +229,9 @@ impl Bridge {
         self.wheel = 0;
         self.pan = 0;
         self.flush_at = None;
-        let r = self.reports.clone();
-        r.send(&r.keyboard, &[0; hid::KBD_LEN]).await;
-        r.send(&r.mouse, &[0; hid::MOUSE_LEN]).await;
-        r.send(&r.consumer, &[0; hid::CONSUMER_LEN]).await;
+        self.hid.send(hid::KBD_ID, &[0; hid::KBD_LEN]).await;
+        self.hid.send(hid::MOUSE_ID, &[0; hid::MOUSE_LEN]).await;
+        self.hid.send(hid::CONSUMER_ID, &[0; hid::CONSUMER_LEN]).await;
     }
 
     pub async fn input(&mut self, ev: InputEvent) {
@@ -325,12 +324,11 @@ impl Bridge {
                     self.mods = if value != 0 { self.mods | bit } else { self.mods & !bit };
                 }
                 self.press(k, value != 0);
-                let r = self.reports.clone();
                 if let Some(usage) = hid::consumer(k) {
                     let usage = if value != 0 { usage } else { 0 };
-                    r.send(&r.consumer, &usage.to_le_bytes()).await;
+                    self.hid.send(hid::CONSUMER_ID, &usage.to_le_bytes()).await;
                 } else {
-                    r.send(&r.keyboard, &hid::keyboard(self.mods, &self.keys)).await;
+                    self.hid.send(hid::KBD_ID, &hid::keyboard(self.mods, &self.keys)).await;
                 }
                 if self.pending_toggle && self.keys.is_empty() {
                     self.pending_toggle = false;
@@ -376,8 +374,7 @@ impl Bridge {
             debug!("first mouse report to the iPad");
         }
         self.sent += 1;
-        let r = self.reports.clone();
-        r.send(&r.mouse, &hid::mouse(self.buttons, dx, dy, wheel, pan)).await;
+        self.hid.send(hid::MOUSE_ID, &hid::mouse(self.buttons, dx, dy, wheel, pan)).await;
     }
 
     pub fn on_ipad(&self) -> bool {
