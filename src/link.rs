@@ -20,6 +20,7 @@ use crate::{debug, log};
 
 const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_L2CAP: libc::c_int = 0;
+const BTPROTO_HCI: libc::c_int = 1;
 const SOL_BLUETOOTH: libc::c_int = 274;
 const BT_SECURITY: libc::c_int = 4;
 const BT_SECURITY_MEDIUM: u8 = 2;
@@ -103,6 +104,33 @@ async fn send(c: &Chan, data: &[u8]) -> io::Result<()> {
         if n < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     })
     .await
+}
+
+#[repr(C)]
+struct HciDevReq {
+    dev_id: u16,
+    dev_opt: u32,
+}
+
+/// HCISETLINKPOL, `_IOW('H', 222, int)`.
+const HCISETLINKPOL: libc::c_ulong = 0x4004_48de;
+/// Role switch allowed, sniff, hold and park refused.
+const LINK_POLICY: u32 = 0x0001;
+
+/// Sets the adapter's default link policy so new links never enter sniff mode. The iPad parks
+/// an idle link in sniff, where this side may send one report per sniff interval (~38ms here),
+/// and the motion queued behind that arrives late. Needs CAP_NET_ADMIN.
+pub fn no_sniff(dev: u16) -> io::Result<()> {
+    let fd = unsafe { libc::socket(AF_BLUETOOTH, libc::SOCK_RAW | libc::SOCK_CLOEXEC, BTPROTO_HCI) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let req = HciDevReq { dev_id: dev, dev_opt: LINK_POLICY };
+    if unsafe { libc::ioctl(fd.as_raw_fd(), HCISETLINKPOL, &req as *const HciDevReq) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Answers the host's HID control requests: every SET is acknowledged, every GET refused.

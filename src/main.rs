@@ -29,7 +29,7 @@ macro_rules! debug {
     ($($t:tt)*) => { println!("<7>{}", format_args!($($t)*)) };
 }
 
-const USAGE: &str = "usage: padbridge [--config PATH] [--pair [SECONDS]]";
+const USAGE: &str = "usage: padbridge [--config PATH] [--pair [SECONDS]] | --no-sniff";
 
 struct Args {
     config: PathBuf,
@@ -52,6 +52,10 @@ fn args() -> Args {
                     None => 120,
                 }
             }
+            "--no-sniff" => match link::no_sniff(0) {
+                Ok(()) => std::process::exit(0),
+                Err(err) => die(&format!("hci0 link policy: {err}")),
+            },
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);

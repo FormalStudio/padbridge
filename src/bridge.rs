@@ -56,6 +56,10 @@ const RETURN_WINDOW: Duration = Duration::from_millis(100);
 /// Motion is summed and sent at most this often, a little under the iPad's connection interval.
 const FLUSH_EVERY: Duration = Duration::from_millis(7);
 const QUERY_EVERY: Duration = Duration::from_millis(8);
+/// Counts the pointer is placed off the iPad's edge on arrival, clear of its edge gestures.
+const EDGE_GAP: i32 = 16;
+/// Steps of 127 counts in the arrival pin, enough to cross the iPad with its acceleration.
+const PIN_STEPS: usize = 24;
 
 pub struct Bridge {
     cfg: Config,
@@ -195,9 +199,15 @@ impl Bridge {
         self.sent = 0;
         self.return_y = self.hypr.cursor().await.map(|(_, y)| y);
         self.grab.send_replace(true);
-        // Pin the iPad's pointer to the edge we arrive from.
+        // Pin the iPad's pointer to the edge we arrive from, in mouse-sized steps: one 32767
+        // delta lands it on the opposite edge, where iPadOS starts its Stage Manager strip
+        // gesture and the pointer stops following. Then step off the edge so the gesture on
+        // this side does not start either.
         let sign = if self.cfg.edge == Edge::Right { -1 } else { 1 };
-        self.send_mouse(sign * 32767, 0, 0, 0).await;
+        for _ in 0..PIN_STEPS {
+            self.send_mouse(sign * 127, 0, 0, 0).await;
+        }
+        self.send_mouse(-sign * EDGE_GAP, 0, 0, 0).await;
         self.vx = 0.0;
         self.push = 0.0;
         self.push_at = None;
@@ -374,7 +384,17 @@ impl Bridge {
             debug!("first mouse report to the iPad");
         }
         self.sent += 1;
-        self.hid.send(hid::MOUSE_ID, &hid::mouse(self.buttons, dx, dy, wheel, pan)).await;
+        // A report carries at most 127 counts an axis; a bigger move goes as several.
+        let (mut dx, mut dy, mut wheel, mut pan) = (dx, dy, wheel, pan);
+        loop {
+            let part = |v: i32| v.clamp(-127, 127);
+            let (px, py, pw, pp) = (part(dx), part(dy), part(wheel), part(pan));
+            self.hid.send(hid::MOUSE_ID, &hid::mouse(self.buttons, px, py, pw, pp)).await;
+            (dx, dy, wheel, pan) = (dx - px, dy - py, wheel - pw, pan - pp);
+            if dx == 0 && dy == 0 && wheel == 0 && pan == 0 {
+                break;
+            }
+        }
     }
 
     pub fn on_ipad(&self) -> bool {
