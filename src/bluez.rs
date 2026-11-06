@@ -13,6 +13,7 @@ use zbus::message::Type as MsgType;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
+use crate::status::Status;
 use crate::{debug, hid, link, log};
 
 const BLUEZ: &str = "org.bluez";
@@ -139,6 +140,8 @@ fn already(err: &zbus::Error) -> bool {
 pub enum Cmd {
     /// The user tried to go to the iPad while its input link is down.
     Wake,
+    /// Asked for from the shell: bring the input link up and give audio fresh tries.
+    Reconnect,
 }
 
 pub struct Bt {
@@ -155,6 +158,7 @@ pub struct Bt {
     audio_at: Option<Instant>,
     audio_tries: u32,
     audio_busy: bool,
+    status: watch::Sender<Status>,
 }
 
 impl Bt {
@@ -164,6 +168,7 @@ impl Bt {
         pair_seconds: u64,
         ipad_tx: watch::Sender<Option<String>>,
         kick: Arc<Notify>,
+        status: watch::Sender<Status>,
     ) -> zbus::Result<Self> {
         let pairing = Arc::new(AtomicBool::new(pair_seconds > 0));
         let server = conn.object_server();
@@ -185,6 +190,7 @@ impl Bt {
             audio_at: None,
             audio_tries: 0,
             audio_busy: false,
+            status,
         })
     }
 
@@ -205,6 +211,14 @@ impl Bt {
             tokio::select! {
                 Some(cmd) = cmds.recv() => match cmd {
                     Cmd::Wake => self.kick.notify_one(),
+                    Cmd::Reconnect => {
+                        log!("reconnect asked for");
+                        self.kick.notify_one();
+                        self.audio_tries = 0;
+                        if self.hid_up && !self.audio_busy {
+                            self.audio_at = Some(Instant::now());
+                        }
+                    }
                 },
                 Ok(()) = hid.changed() => {
                     self.hid_up = *hid.borrow_and_update();
@@ -346,7 +360,15 @@ impl Bt {
             *a = addr.clone();
             changed
         });
-        let Some(addr) = addr else { return };
+        let Some(addr) = addr else {
+            self.status.send_if_modified(|s| {
+                let was = (s.paired, s.audio);
+                (s.paired, s.audio) = (false, false);
+                s.name.clear();
+                was != (false, false)
+            });
+            return;
+        };
         let objs = match managed_objects(&self.conn).await {
             Ok(o) => o,
             Err(err) => return debug!("bluez: {err}"),
@@ -366,8 +388,21 @@ impl Bt {
         }
         let bredr = flag(ifaces, BREDR, "Connected");
         self.set_bredr(bredr);
+        let name = ifaces
+            .iter()
+            .find(|(n, _)| n.as_str() == DEVICE)
+            .and_then(|(_, p)| p.get("Alias"))
+            .and_then(|v| <&str>::try_from(v).ok())
+            .unwrap_or_default()
+            .to_string();
+        let audio = self.bredr_audio().await;
+        self.status.send_if_modified(|s| {
+            let changed = !s.paired || s.audio != audio || s.name != name;
+            (s.paired, s.audio, s.name) = (true, audio, name);
+            changed
+        });
         // Audio that dropped while input stayed up comes back too, a few tries per input link.
-        if self.hid_up && self.audio_at.is_none() && !self.audio_busy && self.audio_tries < AUDIO_TRIES && !self.bredr_audio().await {
+        if self.hid_up && self.audio_at.is_none() && !self.audio_busy && self.audio_tries < AUDIO_TRIES && !audio {
             self.audio_at = Some(Instant::now());
         }
     }
@@ -440,7 +475,10 @@ impl Bt {
     fn audio_done(&mut self, res: Result<(), String>) {
         self.audio_busy = false;
         match res {
-            Ok(()) => log!("audio link up"),
+            Ok(()) => {
+                log!("audio link up");
+                self.status.send_if_modified(|s| !std::mem::replace(&mut s.audio, true));
+            }
             Err(err) => {
                 self.audio_tries += 1;
                 log!("audio link: {err}");

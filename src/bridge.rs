@@ -1,9 +1,10 @@
 //! Where input goes: watching for the edge on this desktop, forwarding to the iPad while there.
 
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use evdev::{EventSummary, InputEvent, KeyCode, RelativeAxisCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -11,22 +12,105 @@ use crate::bluez::Cmd;
 use crate::link::Hid;
 use crate::hid;
 use crate::hypr::{Hypr, Monitor};
+use crate::status::Status;
 use crate::{debug, log};
 
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Edge {
     Left,
     Right,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    pub fn parse(s: &str) -> Option<Edge> {
+        Some(match s {
+            "left" => Edge::Left,
+            "right" => Edge::Right,
+            "top" => Edge::Top,
+            "bottom" => Edge::Bottom,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Top => "top",
+            Edge::Bottom => "bottom",
+        }
+    }
+
+    /// The axis that crosses this edge.
+    fn axis(self) -> RelativeAxisCode {
+        match self {
+            Edge::Left | Edge::Right => RelativeAxisCode::REL_X,
+            Edge::Top | Edge::Bottom => RelativeAxisCode::REL_Y,
+        }
+    }
+
+    /// The sign of motion on `axis` that heads toward this edge.
+    fn outward(self) -> i32 {
+        match self {
+            Edge::Right | Edge::Bottom => 1,
+            Edge::Left | Edge::Top => -1,
+        }
+    }
+}
+
+/// Where the iPad sits: an edge of this desktop and the stretch of it, 0 to 1 from its top or
+/// left end, that leads onto the iPad, as macOS arranges a second display.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Debug)]
+pub struct Position {
+    pub edge: Edge,
+    pub start: f64,
+    pub end: f64,
+}
+
+impl Position {
+    pub fn new(edge: Edge, start: f64, end: f64) -> Option<Position> {
+        (0.0 <= start && start < end && end <= 1.0).then_some(Position { edge, start, end })
+    }
+
+    fn file() -> PathBuf {
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
+        state.join("padbridge/position.json")
+    }
+
+    /// The position the shell last set, or the config's edge, whole.
+    pub fn load(edge: Edge) -> Position {
+        std::fs::read_to_string(Self::file())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Position>(&s).ok())
+            .and_then(|p| Position::new(p.edge, p.start, p.end))
+            .unwrap_or(Position { edge, start: 0.0, end: 1.0 })
+    }
+
+    fn save(&self) {
+        let path = Self::file();
+        let res = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, serde_json::to_string(self).unwrap_or_default()));
+        if let Err(err) = res {
+            log!("{}: {err}", path.display());
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(default)]
 pub struct Config {
-    /// Side of the desktop the iPad sits on.
+    /// Side of the desktop the iPad sits on until the shell sets a position.
     pub edge: Edge,
     /// Mouse counts to cross the iPad, used to tell where its pointer is.
     pub ipad_width: f64,
+    pub ipad_height: f64,
     pub sensitivity: f64,
     /// Counts past the edge before switching, which stops accidental crossings.
     pub edge_push: f64,
@@ -42,6 +126,7 @@ impl Default for Config {
         Config {
             edge: Edge::Left,
             ipad_width: 1800.0,
+            ipad_height: 1260.0,
             sensitivity: 1.0,
             edge_push: 40.0,
             return_push: 300.0,
@@ -68,6 +153,8 @@ pub struct Bridge {
     hid: Hid,
     grab: watch::Sender<bool>,
     wake: mpsc::UnboundedSender<Cmd>,
+    status: watch::Sender<Status>,
+    pos: Position,
     le_up: bool,
     on_ipad: bool,
     pending_toggle: bool,
@@ -80,21 +167,23 @@ pub struct Bridge {
     wheel: i32,
     pan: i32,
     pub flush_at: Option<Instant>,
-    /// Where the iPad's pointer is by our count, 0 at the edge we arrived from.
-    vx: f64,
+    /// How far into the iPad its pointer is by our count, 0 at the edge we arrived from.
+    depth: f64,
     push: f64,
     /// When the current shove began, by the kernel's own event clock: when padbridge gets to
     /// the events can be late and bunched, which would make slow motion look like a shove.
     push_at: Option<SystemTime>,
     last_query: Option<Instant>,
     monitors: Vec<Monitor>,
-    return_y: Option<f64>,
+    /// The cursor where it left this desktop, put back on return.
+    left_at: Option<(f64, f64)>,
     sent: u64,
     warned_down: bool,
 }
 
 impl Bridge {
-    pub fn new(cfg: Config, hid: Hid, grab: watch::Sender<bool>, wake: mpsc::UnboundedSender<Cmd>) -> Self {
+    pub fn new(cfg: Config, hid: Hid, grab: watch::Sender<bool>, wake: mpsc::UnboundedSender<Cmd>, status: watch::Sender<Status>) -> Self {
+        let pos = status.borrow().position;
         let toggle = cfg
             .toggle
             .iter()
@@ -113,6 +202,8 @@ impl Bridge {
             hid,
             grab,
             wake,
+            status,
+            pos,
             le_up: false,
             on_ipad: false,
             pending_toggle: false,
@@ -124,12 +215,12 @@ impl Bridge {
             wheel: 0,
             pan: 0,
             flush_at: None,
-            vx: 0.0,
+            depth: 0.0,
             push: 0.0,
             push_at: None,
             last_query: None,
             monitors: Vec::new(),
-            return_y: None,
+            left_at: None,
             sent: 0,
             warned_down: false,
         }
@@ -151,18 +242,44 @@ impl Bridge {
     }
 
     fn at_edge(&self, x: f64, y: f64) -> bool {
+        let p = self.pos;
         for m in &self.monitors {
             let (w, h) = m.size();
-            if !(m.y <= y && y < m.y + h && m.x <= x && x < m.x + w + 1.0) {
+            if !(m.y <= y && y < m.y + h + 1.0 && m.x <= x && x < m.x + w + 1.0) {
                 continue;
             }
             let mut others = self.monitors.iter().filter(|n| !std::ptr::eq(*n, m));
-            return match self.cfg.edge {
-                Edge::Right => x >= m.x + w - 1.0 && !others.any(|n| n.x == m.x + w),
-                Edge::Left => x <= m.x && !others.any(|n| n.x + n.size().0 == m.x),
+            let (on, along) = match p.edge {
+                Edge::Right => (x >= m.x + w - 1.0 && !others.any(|n| n.x == m.x + w), (y - m.y) / h),
+                Edge::Left => (x <= m.x && !others.any(|n| n.x + n.size().0 == m.x), (y - m.y) / h),
+                Edge::Bottom => (y >= m.y + h - 1.0 && !others.any(|n| n.y == m.y + h), (x - m.x) / w),
+                Edge::Top => (y <= m.y && !others.any(|n| n.y + n.size().1 == m.y), (x - m.x) / w),
             };
+            return on && p.start <= along && along <= p.end;
         }
         false
+    }
+
+    /// Moves the iPad to another edge or stretch, kept for the next start.
+    pub async fn set_position(&mut self, pos: Position) {
+        if pos == self.pos {
+            return;
+        }
+        if self.on_ipad && pos.edge != self.pos.edge {
+            self.leave("moved").await;
+        }
+        self.pos = pos;
+        pos.save();
+        self.status.send_modify(|s| s.position = pos);
+        log!("ipad on the {} edge, {:.2} to {:.2}", pos.edge.name(), pos.start, pos.end);
+    }
+
+    pub async fn switch(&mut self) {
+        if self.on_ipad {
+            self.leave("switch").await;
+        } else {
+            self.enter().await;
+        }
     }
 
     fn held(&self, k: KeyCode) -> bool {
@@ -198,19 +315,24 @@ impl Bridge {
             return;
         }
         self.on_ipad = true;
+        self.status.send_modify(|s| s.active = true);
         self.sent = 0;
-        self.return_y = self.hypr.cursor().await.map(|(_, y)| y);
+        self.left_at = self.hypr.cursor().await;
         self.grab.send_replace(true);
         // Pin the iPad's pointer to the edge we arrive from, in mouse-sized steps: one 32767
         // delta lands it on the opposite edge, where iPadOS starts its Stage Manager strip
         // gesture and the pointer stops following. Then step off the edge so the gesture on
         // this side does not start either.
-        let sign = if self.cfg.edge == Edge::Right { -1 } else { 1 };
+        let sign = -self.pos.edge.outward();
+        let step = |n: i32| match self.pos.edge.axis() {
+            RelativeAxisCode::REL_X => hid::mouse(0, n, 0, 0, 0),
+            _ => hid::mouse(0, 0, n, 0, 0),
+        };
         for _ in 0..PIN_STEPS {
-            self.hid.report(hid::MOUSE_ID, &hid::mouse(0, sign * 127, 0, 0, 0));
+            self.hid.report(hid::MOUSE_ID, &step(sign * 127));
         }
-        self.hid.report(hid::MOUSE_ID, &hid::mouse(0, -sign * EDGE_GAP, 0, 0, 0));
-        self.vx = 0.0;
+        self.hid.report(hid::MOUSE_ID, &step(-sign * EDGE_GAP));
+        self.depth = 0.0;
         self.push = 0.0;
         self.push_at = None;
         log!("-> ipad");
@@ -221,11 +343,17 @@ impl Bridge {
             return;
         }
         self.on_ipad = false;
+        self.status.send_modify(|s| s.active = false);
         self.release_all();
         self.grab.send_replace(false);
+        // Back where it left, a few pixels in from the edge so it does not cross again.
         if let Some((x, y)) = self.hypr.cursor().await {
-            let step = if self.cfg.edge == Edge::Right { -3.0 } else { 3.0 };
-            self.hypr.warp(x + step, self.return_y.unwrap_or(y)).await;
+            let (lx, ly) = self.left_at.unwrap_or((x, y));
+            let step = -3.0 * self.pos.edge.outward() as f64;
+            match self.pos.edge.axis() {
+                RelativeAxisCode::REL_X => self.hypr.warp(x + step, ly).await,
+                _ => self.hypr.warp(lx, y + step).await,
+            }
         }
         self.push = 0.0;
         log!("<- linux ({reason})");
@@ -273,8 +401,8 @@ impl Bridge {
                     _ => {}
                 }
             }
-            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, v) => {
-                let toward = if self.cfg.edge == Edge::Right { v > 0 } else { v < 0 };
+            EventSummary::RelativeAxis(_, axis, v) if axis == self.pos.edge.axis() => {
+                let toward = v * self.pos.edge.outward() > 0;
                 if !toward {
                     self.push = 0.0;
                     return;
@@ -303,17 +431,17 @@ impl Bridge {
             EventSummary::RelativeAxis(_, axis, v) => {
                 let s = self.cfg.sensitivity;
                 match axis {
-                    RelativeAxisCode::REL_X => {
-                        self.dx += v as f64 * s;
-                        self.track_return(v as f64 * s, ev.timestamp()).await;
-                        if !self.on_ipad {
-                            return;
-                        }
-                    }
+                    RelativeAxisCode::REL_X => self.dx += v as f64 * s,
                     RelativeAxisCode::REL_Y => self.dy += v as f64 * s,
                     RelativeAxisCode::REL_WHEEL => self.wheel += v,
                     RelativeAxisCode::REL_HWHEEL => self.pan += v,
                     _ => return,
+                }
+                if axis == self.pos.edge.axis() {
+                    self.track_return(v as f64 * s, ev.timestamp()).await;
+                    if !self.on_ipad {
+                        return;
+                    }
                 }
                 if self.flush_at.is_none() {
                     self.flush_at = Some(Instant::now() + FLUSH_EVERY);
@@ -351,10 +479,11 @@ impl Bridge {
         }
     }
 
-    async fn track_return(&mut self, dx: f64, now: SystemTime) {
+    /// `d` is motion on the axis crossing the edge.
+    async fn track_return(&mut self, d: f64, now: SystemTime) {
         let since = |t: SystemTime| now.duration_since(t).unwrap_or_default();
-        let inward = if self.cfg.edge == Edge::Right { dx } else { -dx };
-        if inward < 0.0 && self.vx <= 0.0 {
+        let inward = d * self.pos.edge.outward() as f64;
+        if inward < 0.0 && self.depth <= 0.0 {
             if self.push_at.is_none_or(|t| since(t) > RETURN_WINDOW) {
                 self.push = 0.0;
                 self.push_at = Some(now);
@@ -369,7 +498,11 @@ impl Bridge {
         }
         self.push = 0.0;
         self.push_at = None;
-        self.vx = (self.vx + inward).clamp(0.0, self.cfg.ipad_width);
+        let span = match self.pos.edge.axis() {
+            RelativeAxisCode::REL_X => self.cfg.ipad_width,
+            _ => self.cfg.ipad_height,
+        };
+        self.depth = (self.depth + inward).clamp(0.0, span);
     }
 
     pub fn flush(&mut self) {

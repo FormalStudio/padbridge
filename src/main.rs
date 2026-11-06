@@ -9,6 +9,7 @@ mod hid;
 mod hypr;
 mod input;
 mod link;
+mod status;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -90,20 +91,23 @@ async fn main() {
 
 async fn run(cfg: bridge::Config, pair: u64) -> zbus::Result<()> {
     let conn = zbus::Connection::system().await?;
+    let (status_tx, status_rx) = watch::channel(status::Status::new(bridge::Position::load(cfg.edge)));
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
+    tokio::spawn(status::serve(status_rx, ctl_tx));
 
     let (up_tx, mut up_rx) = watch::channel(false);
     let (ipad_tx, ipad_rx) = watch::channel(None);
     let link = link::Link::new(up_tx);
     let hid = link.hid.clone();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let bt = bluez::Bt::new(conn.clone(), cfg.name.clone(), pair, ipad_tx, link.kick.clone()).await?;
+    let bt = bluez::Bt::new(conn.clone(), cfg.name.clone(), pair, ipad_tx, link.kick.clone(), status_tx.clone()).await?;
     let mut bt_task = tokio::spawn(bt.run(cmd_rx, up_rx.clone()));
     tokio::spawn(link.run(ipad_rx));
 
     let (grab, _) = watch::channel(false);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let mut open = HashSet::new();
-    let mut bridge = bridge::Bridge::new(cfg, hid, grab.clone(), cmd_tx);
+    let mut bridge = bridge::Bridge::new(cfg, hid, grab.clone(), cmd_tx.clone(), status_tx.clone());
     bridge.refresh_monitors().await;
 
     let mut scan = interval(Duration::from_secs(2));
@@ -131,8 +135,14 @@ async fn run(cfg: bridge::Config, pair: u64) -> zbus::Result<()> {
             },
             Ok(()) = up_rx.changed() => {
                 let up = *up_rx.borrow_and_update();
+                status_tx.send_if_modified(|s| std::mem::replace(&mut s.link, up) != up);
                 bridge.set_link(up).await;
             }
+            Some(c) = ctl_rx.recv() => match c {
+                status::Ctl::SetPosition(p) => bridge.set_position(p).await,
+                status::Ctl::Switch => bridge.switch().await,
+                status::Ctl::Reconnect => { let _ = cmd_tx.send(bluez::Cmd::Reconnect); }
+            },
             _ = scan.tick() => input::scan(&mut open, &grab, &ev_tx),
             _ = monitors.tick() => if !bridge.on_ipad() { bridge.refresh_monitors().await },
         }
