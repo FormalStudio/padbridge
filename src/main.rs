@@ -124,7 +124,7 @@ async fn run(cfg: bridge::Config, pair: u64) -> zbus::Result<()> {
                     _ => Err(zbus::Error::Failure("bluetooth task ended".into())),
                 };
             }
-            _ = async { sleep_until(flush.unwrap()).await }, if flush.is_some() => bridge.flush().await,
+            _ = async { sleep_until(flush.unwrap()).await }, if flush.is_some() => bridge.flush(),
             Some(ev) = ev_rx.recv() => match ev {
                 input::Event::Input(ev) => bridge.input(ev).await,
                 input::Event::Gone(path) => { open.remove(&path); }

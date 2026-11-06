@@ -6,6 +6,7 @@
 //! classic HID device reconnects the way headphones do: it pages the host and opens the control
 //! and interrupt channels itself, so this side decides when input comes back.
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 
-use crate::{debug, log};
+use crate::{debug, hid, log};
 
 const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_L2CAP: libc::c_int = 0;
@@ -157,24 +158,126 @@ fn handshake(msg: u8) -> Option<u8> {
     }
 }
 
-/// Where reports go: the interrupt channel while the link is up.
+/// Counts an axis may wait for the radio: four reports, ~130ms at the iPad's ~30 reports a second.
+const MOTION_BACKLOG: i32 = 4 * 127;
+
+/// Motion not yet sent, summed while the radio is busy so it leaves as one report.
+#[derive(Default)]
+struct Motion {
+    buttons: u8,
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+    pan: i32,
+    dirty: bool,
+}
+
+impl Motion {
+    /// Takes one report's worth, leaving whatever does not fit its fields for the next.
+    fn take(&mut self) -> Vec<u8> {
+        fn part(v: &mut i32, max: i32) -> i32 {
+            let p = (*v).clamp(-max, max);
+            *v -= p;
+            p
+        }
+        let (dx, dy) = (part(&mut self.dx, 127), part(&mut self.dy, 127));
+        let (wheel, pan) = (part(&mut self.wheel, 127), part(&mut self.pan, 127));
+        self.dirty = self.dx != 0 || self.dy != 0 || self.wheel != 0 || self.pan != 0;
+        message(hid::MOUSE_ID, &hid::mouse(self.buttons, dx, dy, wheel, pan))
+    }
+}
+
+#[derive(Default)]
+struct Out {
+    up: bool,
+    /// Keyboard, consumer and button changes, each of which has to arrive.
+    queue: VecDeque<Vec<u8>>,
+    motion: Motion,
+}
+
+fn message(report_id: u8, data: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(data.len() + 2);
+    msg.extend_from_slice(&[DATA_INPUT, report_id]);
+    msg.extend_from_slice(data);
+    msg
+}
+
+/// Where reports go. Nothing here waits on the radio: a sender task drains it while the link
+/// is up, and motion that piles up while the radio is busy is merged rather than queued, so a
+/// stall never comes out as a burst of old movement.
 #[derive(Clone, Default)]
 pub struct Hid {
-    chan: Arc<Mutex<Option<Chan>>>,
+    out: Arc<Mutex<Out>>,
+    ready: Arc<Notify>,
 }
 
 impl Hid {
-    /// Sends one input report. A report that cannot go out within 50ms is dropped, so a
-    /// congested radio never stalls the input loop.
-    pub async fn send(&self, report_id: u8, data: &[u8]) {
-        let Some(c) = self.chan.lock().unwrap().clone() else { return };
-        let mut msg = Vec::with_capacity(data.len() + 2);
-        msg.extend_from_slice(&[DATA_INPUT, report_id]);
-        msg.extend_from_slice(data);
-        match timeout(Duration::from_millis(50), send(&c, &msg)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => debug!("report: {err}"),
-            Err(_) => debug!("report dropped, link congested"),
+    pub fn report(&self, report_id: u8, data: &[u8]) {
+        let mut o = self.out.lock().unwrap();
+        if !o.up {
+            return;
+        }
+        // Motion before this report has to arrive before it.
+        while o.motion.dirty {
+            let m = o.motion.take();
+            o.queue.push_back(m);
+        }
+        o.queue.push_back(message(report_id, data));
+        drop(o);
+        self.ready.notify_one();
+    }
+
+    pub fn motion(&self, buttons: u8, dx: i32, dy: i32, wheel: i32, pan: i32) {
+        let mut o = self.out.lock().unwrap();
+        if !o.up {
+            return;
+        }
+        // A press and its release merged into one report would be a lost click.
+        if buttons != o.motion.buttons {
+            while o.motion.dirty {
+                let m = o.motion.take();
+                o.queue.push_back(m);
+            }
+            o.motion.buttons = buttons;
+            o.queue.push_back(message(hid::MOUSE_ID, &hid::mouse(buttons, dx, dy, wheel, pan)));
+        } else {
+            let m = &mut o.motion;
+            // Past a few reports' worth the radio cannot catch up before the hand has moved on,
+            // so the rest is dropped rather than played back late.
+            m.dx = m.dx.saturating_add(dx).clamp(-MOTION_BACKLOG, MOTION_BACKLOG);
+            m.dy = m.dy.saturating_add(dy).clamp(-MOTION_BACKLOG, MOTION_BACKLOG);
+            m.wheel = m.wheel.saturating_add(wheel);
+            m.pan = m.pan.saturating_add(pan);
+            m.dirty = true;
+        }
+        drop(o);
+        self.ready.notify_one();
+    }
+
+    fn set_up(&self, up: bool) {
+        let mut o = self.out.lock().unwrap();
+        *o = Out { up, ..Out::default() };
+    }
+
+    fn next(&self) -> Option<Vec<u8>> {
+        let mut o = self.out.lock().unwrap();
+        if let Some(m) = o.queue.pop_front() {
+            return Some(m);
+        }
+        o.motion.dirty.then(|| o.motion.take())
+    }
+
+    /// Sends whatever is pending, one report each time the socket can take one.
+    async fn pump(&self, c: &Chan) -> String {
+        loop {
+            match self.next() {
+                Some(msg) => {
+                    if let Err(err) = send(c, &msg).await {
+                        return err.to_string();
+                    }
+                }
+                None => self.ready.notified().await,
+            }
         }
     }
 }
@@ -205,11 +308,14 @@ impl Link {
             match self.connect(addr).await {
                 Ok((control, interrupt)) => {
                     backoff = Duration::from_secs(2);
-                    *self.hid.chan.lock().unwrap() = Some(interrupt.clone());
+                    self.hid.set_up(true);
                     self.up.send_replace(true);
                     log!("input link up");
-                    let why = serve(&control, &interrupt).await;
-                    *self.hid.chan.lock().unwrap() = None;
+                    let why = tokio::select! {
+                        why = serve(&control, &interrupt) => why,
+                        why = self.hid.pump(&interrupt) => why,
+                    };
+                    self.hid.set_up(false);
                     self.up.send_replace(false);
                     log!("input link down: {why}");
                 }
@@ -231,6 +337,12 @@ impl Link {
         let attempt = async {
             let control = open(addr, PSM_CONTROL).await?;
             let interrupt = open(addr, PSM_INTERRUPT).await?;
+            // The smallest send buffer the kernel allows, so the socket stops taking reports
+            // as soon as the radio falls behind and the rest merge in Motion instead.
+            let one: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(interrupt.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, &one as *const _ as *const libc::c_void, size_of::<libc::c_int>() as u32);
+            }
             Ok::<_, io::Error>((control, interrupt))
         };
         timeout(Duration::from_secs(15), attempt).await.unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
@@ -308,6 +420,28 @@ mod tests {
     fn address_is_little_endian() {
         assert_eq!(parse_addr("C8:89:F3:45:A7:AA"), Some([0xAA, 0xA7, 0x45, 0xF3, 0x89, 0xC8]));
         assert_eq!(parse_addr("nope"), None);
+    }
+
+    #[test]
+    fn motion_merges_but_clicks_do_not() {
+        let h = Hid::default();
+        h.set_up(true);
+        h.motion(0, 3, 1, 0, 0);
+        h.motion(0, 4, -1, 0, 0);
+        h.motion(1, 0, 0, 0, 0);
+        h.motion(0, 0, 0, 0, 0);
+        h.motion(0, 300, 0, 0, 0);
+        h.motion(0, 900, 0, 0, 0);
+        let sent: Vec<_> = std::iter::from_fn(|| h.next()).collect();
+        assert_eq!(sent, vec![
+            message(hid::MOUSE_ID, &hid::mouse(0, 7, 0, 0, 0)),
+            message(hid::MOUSE_ID, &hid::mouse(1, 0, 0, 0, 0)),
+            message(hid::MOUSE_ID, &hid::mouse(0, 0, 0, 0, 0)),
+            message(hid::MOUSE_ID, &hid::mouse(0, 127, 0, 0, 0)),
+            message(hid::MOUSE_ID, &hid::mouse(0, 127, 0, 0, 0)),
+            message(hid::MOUSE_ID, &hid::mouse(0, 127, 0, 0, 0)),
+            message(hid::MOUSE_ID, &hid::mouse(0, 127, 0, 0, 0)),
+        ]);
     }
 
     #[test]
