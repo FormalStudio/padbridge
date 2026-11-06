@@ -291,12 +291,6 @@ impl Link {
         let attempt = async {
             let control = open(addr, PSM_CONTROL).await?;
             let interrupt = open(addr, PSM_INTERRUPT).await?;
-            // The smallest send buffer the kernel allows, so the socket stops taking reports
-            // as soon as the radio falls behind and the rest merge in Motion instead.
-            let one: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(interrupt.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, &one as *const _ as *const libc::c_void, size_of::<libc::c_int>() as u32);
-            }
             Ok::<_, io::Error>((control, interrupt))
         };
         timeout(Duration::from_secs(15), attempt).await.unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
