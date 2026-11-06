@@ -1,6 +1,6 @@
 //! Where input goes: watching for the edge on this desktop, forwarding to the iPad while there.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use evdev::{EventSummary, InputEvent, KeyCode, RelativeAxisCode};
 use serde::Deserialize;
@@ -79,9 +79,7 @@ pub struct Bridge {
     /// Where the iPad's pointer is by our count, 0 at the edge we arrived from.
     vx: f64,
     push: f64,
-    /// When the current shove began, by the kernel's own event clock: when padbridge gets to
-    /// the events can be late and bunched, which would make slow motion look like a shove.
-    push_at: Option<SystemTime>,
+    push_at: Option<Instant>,
     last_query: Option<Instant>,
     monitors: Vec<Monitor>,
     return_y: Option<f64>,
@@ -199,7 +197,7 @@ impl Bridge {
         self.grab.send_replace(true);
         // Pin the iPad's pointer to the edge we arrive from.
         let sign = if self.cfg.edge == Edge::Right { -1 } else { 1 };
-        self.send_mouse(sign * 32767, 0, 0, 0);
+        self.send_mouse(sign * 32767, 0, 0, 0).await;
         self.vx = 0.0;
         self.push = 0.0;
         self.push_at = None;
@@ -211,7 +209,7 @@ impl Bridge {
             return;
         }
         self.on_ipad = false;
-        self.release_all();
+        self.release_all().await;
         self.grab.send_replace(false);
         if let Some((x, y)) = self.hypr.cursor().await {
             let step = if self.cfg.edge == Edge::Right { -3.0 } else { 3.0 };
@@ -222,7 +220,7 @@ impl Bridge {
         debug!("sent {} mouse reports while on the iPad", self.sent);
     }
 
-    pub fn release_all(&mut self) {
+    pub async fn release_all(&mut self) {
         self.keys.clear();
         self.mods = 0;
         self.buttons = 0;
@@ -231,9 +229,9 @@ impl Bridge {
         self.wheel = 0;
         self.pan = 0;
         self.flush_at = None;
-        self.hid.report(hid::KBD_ID, &[0; hid::KBD_LEN]);
-        self.hid.motion(0, 0, 0, 0, 0);
-        self.hid.report(hid::CONSUMER_ID, &[0; hid::CONSUMER_LEN]);
+        self.hid.send(hid::KBD_ID, &[0; hid::KBD_LEN]).await;
+        self.hid.send(hid::MOUSE_ID, &[0; hid::MOUSE_LEN]).await;
+        self.hid.send(hid::CONSUMER_ID, &[0; hid::CONSUMER_LEN]).await;
     }
 
     pub async fn input(&mut self, ev: InputEvent) {
@@ -295,7 +293,7 @@ impl Bridge {
                 match axis {
                     RelativeAxisCode::REL_X => {
                         self.dx += v as f64 * s;
-                        self.track_return(v as f64 * s, ev.timestamp()).await;
+                        self.track_return(v as f64 * s).await;
                         if !self.on_ipad {
                             return;
                         }
@@ -313,7 +311,7 @@ impl Bridge {
                 if let Some(bit) = hid::button(k) {
                     self.buttons = if value != 0 { self.buttons | bit } else { self.buttons & !bit };
                     self.press(k, value != 0);
-                    return self.flush();
+                    return self.flush().await;
                 }
                 // The iPad does its own key repeat.
                 if value == 2 {
@@ -328,9 +326,9 @@ impl Bridge {
                 self.press(k, value != 0);
                 if let Some(usage) = hid::consumer(k) {
                     let usage = if value != 0 { usage } else { 0 };
-                    self.hid.report(hid::CONSUMER_ID, &usage.to_le_bytes());
+                    self.hid.send(hid::CONSUMER_ID, &usage.to_le_bytes()).await;
                 } else {
-                    self.hid.report(hid::KBD_ID, &hid::keyboard(self.mods, &self.keys));
+                    self.hid.send(hid::KBD_ID, &hid::keyboard(self.mods, &self.keys)).await;
                 }
                 if self.pending_toggle && self.keys.is_empty() {
                     self.pending_toggle = false;
@@ -341,17 +339,17 @@ impl Bridge {
         }
     }
 
-    async fn track_return(&mut self, dx: f64, now: SystemTime) {
-        let since = |t: SystemTime| now.duration_since(t).unwrap_or_default();
+    async fn track_return(&mut self, dx: f64) {
         let inward = if self.cfg.edge == Edge::Right { dx } else { -dx };
         if inward < 0.0 && self.vx <= 0.0 {
-            if self.push_at.is_none_or(|t| since(t) > RETURN_WINDOW) {
+            let now = Instant::now();
+            if self.push_at.is_none_or(|t| now - t > RETURN_WINDOW) {
                 self.push = 0.0;
                 self.push_at = Some(now);
             }
             self.push -= inward;
             if self.push >= self.cfg.return_push && self.keys.is_empty() && self.buttons == 0 {
-                let took = self.push_at.map(since).unwrap_or_default();
+                let took = self.push_at.map(|t| now - t).unwrap_or_default();
                 debug!("shove of {:.0} counts in {:.3}s", self.push, took.as_secs_f64());
                 self.leave("shove").await;
             }
@@ -362,21 +360,21 @@ impl Bridge {
         self.vx = (self.vx + inward).clamp(0.0, self.cfg.ipad_width);
     }
 
-    pub fn flush(&mut self) {
+    pub async fn flush(&mut self) {
         self.flush_at = None;
         let (dx, dy) = (self.dx.trunc(), self.dy.trunc());
         self.dx -= dx;
         self.dy -= dy;
         let (wheel, pan) = (std::mem::take(&mut self.wheel), std::mem::take(&mut self.pan));
-        self.send_mouse(dx as i32, dy as i32, wheel, pan);
+        self.send_mouse(dx as i32, dy as i32, wheel, pan).await;
     }
 
-    fn send_mouse(&mut self, dx: i32, dy: i32, wheel: i32, pan: i32) {
+    async fn send_mouse(&mut self, dx: i32, dy: i32, wheel: i32, pan: i32) {
         if self.sent == 0 {
             debug!("first mouse report to the iPad");
         }
         self.sent += 1;
-        self.hid.motion(self.buttons, dx, dy, wheel, pan);
+        self.hid.send(hid::MOUSE_ID, &hid::mouse(self.buttons, dx, dy, wheel, pan)).await;
     }
 
     pub fn on_ipad(&self) -> bool {
