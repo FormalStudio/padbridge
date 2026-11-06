@@ -107,30 +107,43 @@ async fn send(c: &Chan, data: &[u8]) -> io::Result<()> {
 }
 
 #[repr(C)]
-struct HciDevReq {
-    dev_id: u16,
-    dev_opt: u32,
+struct SockaddrHci {
+    family: libc::sa_family_t,
+    dev: u16,
+    channel: u16,
 }
 
-/// HCISETLINKPOL, `_IOW('H', 222, int)`.
-const HCISETLINKPOL: libc::c_ulong = 0x4004_48de;
-/// Role switch allowed, sniff, hold and park refused.
-const LINK_POLICY: u32 = 0x0001;
+/// HCI Write Default Link Policy Settings: role switch allowed, sniff, hold and park refused.
+const WRITE_DEFAULT_LINK_POLICY: [u8; 6] = [0x01, 0x0f, 0x08, 0x02, 0x01, 0x00];
 
-/// Sets the adapter's default link policy so new links never enter sniff mode. The iPad parks
-/// an idle link in sniff, where this side may send one report per sniff interval (~38ms here),
-/// and the motion queued behind that arrives late. Needs CAP_NET_ADMIN.
+/// Has the adapter refuse sniff mode on new links. The iPad parks an idle link in sniff, where
+/// this side may send one report per sniff interval (~38ms here) and the motion queued behind
+/// that arrives late. The adapter takes its default back on every power up, so this runs after
+/// bluetoothd starts, waiting for hci0 to come up. Needs CAP_NET_RAW.
 pub fn no_sniff(dev: u16) -> io::Result<()> {
     let fd = unsafe { libc::socket(AF_BLUETOOTH, libc::SOCK_RAW | libc::SOCK_CLOEXEC, BTPROTO_HCI) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let req = HciDevReq { dev_id: dev, dev_opt: LINK_POLICY };
-    if unsafe { libc::ioctl(fd.as_raw_fd(), HCISETLINKPOL, &req as *const HciDevReq) } < 0 {
+    let sa = SockaddrHci { family: AF_BLUETOOTH as libc::sa_family_t, dev, channel: 0 };
+    if unsafe { libc::bind(fd.as_raw_fd(), &sa as *const _ as *const libc::sockaddr, size_of::<SockaddrHci>() as u32) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let mut tries = 0;
+    loop {
+        let cmd = &WRITE_DEFAULT_LINK_POLICY;
+        let n = unsafe { libc::write(fd.as_raw_fd(), cmd.as_ptr() as *const libc::c_void, cmd.len()) };
+        if n >= 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        tries += 1;
+        if err.raw_os_error() != Some(libc::ENETDOWN) || tries == 60 {
+            return Err(err);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Answers the host's HID control requests: every SET is acknowledged, every GET refused.
